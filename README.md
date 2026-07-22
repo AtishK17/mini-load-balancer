@@ -35,12 +35,24 @@ Terminal 1 — start the dummy backend:
 ./build/dummy_backend 9000
 ```
 
-Terminal 2 — start the load balancer:
+Terminal 2 — start the dummy backend:
+```bash
+./build/dummy_backend 9001
+```
+
+Terminal 3 — start the dummy backend:
+```bash
+./build/dummy_backend 9002
+```
+
+Terminal 4 — start the load balancer:
 ```bash
 ./build/lb
 ```
 
-Terminal 3 — send a request through it:
+Terminal 5 — send a request through it:
 ```bash
+curl http://127.0.0.1:8080/
+curl http://127.0.0.1:8080/
 curl http://127.0.0.1:8080/
 ```

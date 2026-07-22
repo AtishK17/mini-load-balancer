@@ -13,7 +13,7 @@ routing — rather than have a framework hide it.
 
 - [x] **M1** — Single-threaded epoll event loop, accept loop, naive proxy to
       one hardcoded backend (blocking connect/read to backend for now).
-- [ ] **M2** — Backend pool + round robin, then weighted round robin / least
+- [x] **M2** — Backend pool + round robin, then weighted round robin / least
       connections.
 - [ ] **M3** — Active + passive health checks.
 - [ ] **M4** — Minimal HTTP parsing, host-based routing, keep-alive support.

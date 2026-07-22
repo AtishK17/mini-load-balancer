@@ -26,13 +26,18 @@ int main(int argc, char* argv[]) {
  
     printf("Dummy backend listening on port %d\n", port);
  
-    const char* response =
-        "HTTP/1.1 200 OK\r\n"
-        "Content-Type: text/plain\r\n"
-        "Content-Length: 15\r\n"
-        "Connection: close\r\n"
-        "\r\n"
-        "Hello from 9000\n";
+    char body[64];
+	snprintf(body, sizeof(body), "Hello from %d\n", port);
+
+	char response[256];
+	snprintf(response, sizeof(response),
+		"HTTP/1.1 200 OK\r\n"
+		"Content-Type: text/plain\r\n"
+		"Content-Length: %zu\r\n"
+		"Connection: close\r\n"
+		"\r\n"
+		"%s",
+		strlen(body), body);
  
     while (true) {
         sockaddr_in client_addr{};

@@ -9,23 +9,40 @@
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
+#include <string>
 
 constexpr int LISTEN_PORT = 8080;
 constexpr int MAX_EVENTS = 64;
 
-constexpr const char* BACKEND_IP = "127.0.0.1";
-constexpr int BACKEND_PORT = 9000;
+struct Backend {
+    std::string ip;
+    int         port;
+};
 
-// Connects (blocking, for now — good enough for M1) to the backend and
-// forwards the request bytes we already read from the client, then reads
-// the backend's response and writes it straight back to the client.
-//
-// NOTE: this blocking connect+read will freeze the whole event loop while
-// it runs. That's fine for proving the proxy works end-to-end, but it's
-// exactly the problem M2/M3 will fix once we add the backend pool and
-// register backend sockets with epoll too, instead of blocking on them.
+// M2: instead of one hardcoded backend, we now have a pool to rotate across.
+// Start three dummy_backend instances on these ports to test round robin:
+//   ./dummy_backend 9000
+//   ./dummy_backend 9001
+//   ./dummy_backend 9002
+std::vector<Backend> backends = {
+    {"127.0.0.1", 9000},
+    {"127.0.0.1", 9001},
+    {"127.0.0.1", 9002},
+};
 
-static void proxy_to_backend(int client_fd, const char* request, ssize_t request_len)
+// Tracks which backend gets the *next* request. Advances every call.
+size_t next_backend_index = 0;
+
+// Round robin: hand back the backend at the current index, then move the
+// index forward, wrapping back to 0 once we reach the end of the list.
+static Backend& get_next_backend() {
+    Backend& b = backends[next_backend_index];
+    next_backend_index = (next_backend_index + 1) % backends.size();
+    return b;
+}
+
+
+static void proxy_to_backend(int client_fd, const char* request, ssize_t request_len, const Backend& backend)
 {
 	int backend_fd = socket(AF_INET, SOCK_STREAM, 0);
 	if(backend_fd < 0)
@@ -36,8 +53,8 @@ static void proxy_to_backend(int client_fd, const char* request, ssize_t request
 	
 	sockaddr_in backend_addr{};
 	backend_addr.sin_family = AF_INET;
-	backend_addr.sin_port = htons(BACKEND_PORT);
-	inet_pton(AF_INET, BACKEND_IP, &backend_addr.sin_addr);
+	backend_addr.sin_port = htons(backend.port);
+	inet_pton(AF_INET, backend.ip.c_str(), &backend_addr.sin_addr);
 	
 	if(connect(backend_fd, (sockaddr*)&backend_addr, sizeof(backend_addr)) < 0)
 	{
@@ -172,8 +189,9 @@ int main()
 					continue;
 				}
 				
-				printf("Read %zd bytes from fd %d, forwarding to backend...\n", n, client_fd);
-				proxy_to_backend(client_fd, buf, n);
+				Backend& backend = get_next_backend();
+				printf("Read %zd bytes from fd %d, forwarding to %s:%d...\n", n, client_fd, backend.ip.c_str(), backend.port);
+				proxy_to_backend(client_fd, buf, n, backend);
 				// Naive M1 behavior: one request per connection, then close.
 				// Real HTTP keep-alive support comes later once we're
 				// parsing headers properly (M4).

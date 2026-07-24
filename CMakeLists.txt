@@ -8,3 +8,4 @@ add_compile_options(-Wall -Wextra)      # applies these warnings to ALL targets 
 
 add_executable(lb src/main.cpp)               # target 1: the load balancer
 add_executable(dummy_backend src/dummy_backend.cpp)  # target 2: the test backend
+add_executable(slow_backend src/slow_backend.cpp)

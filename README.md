@@ -13,7 +13,7 @@ routing — rather than have a framework hide it.
 
 - [x] **M1** — Single-threaded epoll event loop, accept loop, naive proxy to
       one hardcoded backend (blocking connect/read to backend for now).
-- [ ] **M2** — Backend pool + round robin, then weighted round robin / least
+- [x] **M2** — Backend pool + round robin, then weighted round robin / least
       connections.
 - [ ] **M3** — Active + passive health checks.
 - [ ] **M4** — Minimal HTTP parsing, host-based routing, keep-alive support.
@@ -35,12 +35,24 @@ Terminal 1 — start the dummy backend:
 ./build/dummy_backend 9000
 ```
 
-Terminal 2 — start the load balancer:
+Terminal 2 — start the dummy backend:
+```bash
+./build/dummy_backend 9001
+```
+
+Terminal 3 — start the dummy backend:
+```bash
+./build/dummy_backend 9002
+```
+
+Terminal 4 — start the load balancer:
 ```bash
 ./build/lb
 ```
 
-Terminal 3 — send a request through it:
+Terminal 5 — send a request through it:
 ```bash
+curl http://127.0.0.1:8080/
+curl http://127.0.0.1:8080/
 curl http://127.0.0.1:8080/
 ```

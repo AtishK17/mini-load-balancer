@@ -7,5 +7,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 add_compile_options(-Wall -Wextra)      # applies these warnings to ALL targets below
 
 add_executable(lb src/main.cpp)               # target 1: the load balancer
+find_package(Threads REQUIRED)
+target_link_libraries(lb PRIVATE Threads::Threads)
 add_executable(dummy_backend src/dummy_backend.cpp)  # target 2: the test backend
 add_executable(slow_backend src/slow_backend.cpp)

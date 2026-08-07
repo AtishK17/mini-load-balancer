@@ -5,19 +5,29 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
 #include <cerrno>
 #include <vector>
 #include <string>
+#include <atomic>
+#include <thread>
+#include <chrono>
+#include <memory>
 
 constexpr int LISTEN_PORT = 8080;
 constexpr int MAX_EVENTS = 64;
+constexpr int HEALTH_CHECK_INTERVAL_S = 5;
+constexpr int HEALTH_CHECK_TIMEOUT_MS = 1000;
 
 struct Backend {
 	std::string ip;
 	int port;
+	std::atomic<bool> healthy{true};
+	
+	Backend(std::string ip_, int port_) : ip(std::move(ip_)), port(port_) {}
 };
 
 // M2: instead of one hardcoded backend, we now have a pool to rotate across.
@@ -25,21 +35,31 @@ struct Backend {
 //   ./dummy_backend 9000
 //   ./dummy_backend 9001
 //   ./dummy_backend 9002
-std::vector<Backend> backends = {
-	{"127.0.0.1", 9000},
-	{"127.0.0.1", 9001},
-	{"127.0.0.1", 9002},
-};
+std::vector<std::unique_ptr<Backend>> backends;
+
+static void init_backends() {
+	backends.push_back(std::make_unique<Backend>("127.0.0.1", 9000));
+	backends.push_back(std::make_unique<Backend>("127.0.0.1", 9001));
+	backends.push_back(std::make_unique<Backend>("127.0.0.1", 9002));
+}
 
 // Tracks which backend gets the *next* request. Advances every call.
 size_t next_backend_index = 0;
 
 // Round robin: hand back the backend at the current index, then move the
 // index forward, wrapping back to 0 once we reach the end of the list.
-static Backend& get_next_backend() {
-	Backend& b = backends[next_backend_index];
-	next_backend_index = (next_backend_index + 1) % backends.size();
-	return b;
+static Backend* get_next_backend() {
+	size_t start = next_backend_index;
+	for(size_t i = 0; i < backends.size(); i++)
+	{
+		size_t idx = (start + i) % backends.size();
+		if(backends[idx]->healthy.load())
+		{
+			next_backend_index = (idx + 1) % backends.size();
+			return backends[idx].get();
+		}
+	}
+	return nullptr; // every backend is down
 }
 
 // ---------------------------------------------------------------------------
@@ -71,6 +91,7 @@ struct Connection {
 	int client_fd  = -1;
 	int backend_fd = -1;
 	ConnState state = ConnState::READING_REQUEST;
+	Backend* backend = nullptr;
 
 	std::string request;              // bytes read from the client
 	std::string response;             // bytes read from the backend
@@ -160,8 +181,15 @@ static void close_connection(int epfd, Connection* conn)
 
 static void begin_backend_connect(int epfd, Connection* conn)
 {
-	Backend& backend = get_next_backend();
-	printf("Connection to backend %s:%d for fd %d...\n", backend.ip.c_str(), backend.port, conn->client_fd);
+	Backend* backend = get_next_backend();
+	if(!backend)
+	{
+		fprintf(stderr, "No healthy backends available! Dropping client fd %d.\n", conn->client_fd);
+		close_connection(epfd, conn);
+		return;
+	}
+	printf("Connection to backend %s:%d for fd %d...\n", backend->ip.c_str(), backend->port, conn->client_fd);
+	conn->backend = backend;
 	
 	int backend_fd = socket(AF_INET, SOCK_STREAM, 0);
 	if(backend_fd < 0)
@@ -174,8 +202,8 @@ static void begin_backend_connect(int epfd, Connection* conn)
 	
 	sockaddr_in backend_addr{};
 	backend_addr.sin_family = AF_INET;
-	backend_addr.sin_port = htons(backend.port);
-	inet_pton(AF_INET, backend.ip.c_str(), &backend_addr.sin_addr);
+	backend_addr.sin_port = htons(backend->port);
+	inet_pton(AF_INET, backend->ip.c_str(), &backend_addr.sin_addr);
 	
 	conn->backend_fd = backend_fd;
 	conn->backend_ctx = new SocketCtx{conn, true};
@@ -200,6 +228,8 @@ static void begin_backend_connect(int epfd, Connection* conn)
 	else
 	{
 		perror("connect to backend failed");
+		backend->healthy.store(false);
+		fprintf(stderr, "Marking backend %s:%d UNHEALTHY (passive check)\n", backend->ip.c_str(), backend->port);
 		close_connection(epfd, conn);
 	}
 }
@@ -258,6 +288,12 @@ static void handle_backend_event(int epfd, Connection* conn)
 		if(err != 0)
 		{
 			fprintf(stderr, "backend connect failed: %s\n", strerror(err));
+			if (conn->backend)
+			{
+				conn->backend->healthy.store(false);
+				fprintf(stderr, "Marking backend %s:%d UNHEALTHY (passive check)\n",
+				conn->backend->ip.c_str(), conn->backend->port);
+			}
 			close_connection(epfd, conn);
 			return;
 		}
@@ -310,6 +346,67 @@ static void handle_backend_event(int epfd, Connection* conn)
 	}
 }
 
+static bool tcp_probe(const std::string& ip, int port, int timeout_ms)
+{
+	int fd = socket(AF_INET, SOCK_STREAM, 0);
+	if(fd < 0) return false;
+	set_nonblocking(fd);
+	
+	sockaddr_in addr{};
+	addr.sin_family = AF_INET;
+	addr.sin_port = htons(port);
+	inet_pton(AF_INET, ip.c_str(), &addr.sin_addr);
+	
+	int rc = connect(fd, (sockaddr*)&addr, sizeof(addr));
+	if(rc == 0)
+	{
+		close(fd);
+		return true;
+	}
+	
+	if(errno != EINPROGRESS)
+	{
+		close(fd);
+		return false;
+	}
+	pollfd pfd{};
+	pfd.fd = fd;
+	pfd.events = POLLOUT;
+	
+	int ready = poll(&pfd, 1, timeout_ms);
+	if(ready <= 0)
+	{
+		close(fd);
+		return false;
+	}
+	
+	int err = 0;
+	socklen_t len = sizeof(err);
+	getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len);
+	close(fd);
+	return err == 0;
+}
+
+static void health_check_loop()
+{
+	while(true)
+	{
+		for (auto& backend_ptr : backends)
+		{
+			Backend& backend = *backend_ptr;
+			bool ok = tcp_probe(backend.ip, backend.port, HEALTH_CHECK_TIMEOUT_MS);
+			bool was_healthy = backend.healthy.load();
+			
+			if(ok != was_healthy)
+			{
+				backend.healthy.store(ok);
+				printf("[health check] backend %s:%d is now %s\n", backend.ip.c_str(), backend.port, ok? "HEALTHY" : "UNHEALTHY");
+			}
+		}
+		std::this_thread::sleep_for(std::chrono::seconds(HEALTH_CHECK_INTERVAL_S));
+	}
+}
+
 // Create, bind, and listen on the port clients will connect to.
 static int create_listen_socket(int port)
 {
@@ -345,6 +442,10 @@ static int create_listen_socket(int port)
 
 int main()
 {
+	init_backends();
+	std::thread health_thread(health_check_loop);
+	health_thread.detach();
+	
 	int listen_fd = create_listen_socket(LISTEN_PORT);
 	printf("Listening on port %d...\n", LISTEN_PORT);
 	

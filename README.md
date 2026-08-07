@@ -15,7 +15,7 @@ routing — rather than have a framework hide it.
       one hardcoded backend (blocking connect/read to backend for now).
 - [x] **M2** — Backend pool + round robin, then weighted round robin / least
       connections.
-- [ ] **M3** — Active + passive health checks.
+- [x] **M3** — Active + passive health checks.
 - [ ] **M4** — Minimal HTTP parsing, host-based routing, keep-alive support.
 - [ ] **M5** — Stats endpoint + live dashboard.
 - [ ] Stretch: config hot-reload, TLS termination, graceful shutdown.

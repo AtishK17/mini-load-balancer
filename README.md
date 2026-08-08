@@ -16,7 +16,7 @@ routing — rather than have a framework hide it.
 - [x] **M2** — Backend pool + round robin, then weighted round robin / least
       connections.
 - [x] **M3** — Active + passive health checks.
-- [ ] **M4** — Minimal HTTP parsing, host-based routing, keep-alive support.
+- [x] **M4** — Minimal HTTP parsing, host-based routing, keep-alive support.
 - [ ] **M5** — Stats endpoint + live dashboard.
 - [ ] Stretch: config hot-reload, TLS termination, graceful shutdown.
 

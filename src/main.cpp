@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cerrno>
+#include <cctype>
 #include <vector>
 #include <string>
 #include <atomic>
@@ -22,12 +23,21 @@ constexpr int MAX_EVENTS = 64;
 constexpr int HEALTH_CHECK_INTERVAL_S = 5;
 constexpr int HEALTH_CHECK_TIMEOUT_MS = 1000;
 
-struct Backend {
+struct Backend
+{
 	std::string ip;
 	int port;
 	std::atomic<bool> healthy{true};
 	
 	Backend(std::string ip_, int port_) : ip(std::move(ip_)), port(port_) {}
+};
+std::vector<std::unique_ptr<Backend>> all_backends;
+
+struct Route
+{
+	std::string host;
+	std::vector<Backend*> backends;
+	size_t next_index = 0;
 };
 
 // M2: instead of one hardcoded backend, we now have a pool to rotate across.
@@ -35,28 +45,69 @@ struct Backend {
 //   ./dummy_backend 9000
 //   ./dummy_backend 9001
 //   ./dummy_backend 9002
-std::vector<std::unique_ptr<Backend>> backends;
+std::vector<std::unique_ptr<Route>> routes;
+Route* default_route =  nullptr;
 
-static void init_backends() {
-	backends.push_back(std::make_unique<Backend>("127.0.0.1", 9000));
-	backends.push_back(std::make_unique<Backend>("127.0.0.1", 9001));
-	backends.push_back(std::make_unique<Backend>("127.0.0.1", 9002));
+static void init_backends_and_routes()
+{
+	all_backends.push_back(std::make_unique<Backend>("127.0.0.1", 9000));
+	all_backends.push_back(std::make_unique<Backend>("127.0.0.1", 9001));
+	all_backends.push_back(std::make_unique<Backend>("127.0.0.1", 9002));
+	
+	Backend* b9000 = all_backends[0].get();
+	Backend* b9001 = all_backends[1].get();
+	Backend* b9002 = all_backends[2].get();
+	
+	auto api = std::make_unique<Route>();
+	api->host = "api.local";
+	api->backends = {b9000, b9001};
+	routes.push_back(std::move(api));
+	
+	auto stat = std::make_unique<Route>();
+	stat->host = "static.local";
+	stat->backends = {b9002};
+	routes.push_back(std::move(stat));
+	
+	auto def = std::make_unique<Route>();
+	def->host = ""; // matches nothing by name - used as fallback
+	def->backends = {b9000, b9001, b9002};
+	routes.push_back(std::move(def));
+	default_route = routes.back().get();
+}
+
+// Finds the route whose configured host matches the client's Host header
+// (ignoring a ":port" suffix if present), falling back to the default
+// route if there's no match or no Host header at all.
+static Route* find_route(const std::string& host)
+{
+	std::string host_only = host;
+	size_t colon = host_only.find(':');
+	if(colon != std::string::npos) host_only = host_only.substr(0, colon);
+	
+	for(auto& r: routes)
+	{
+		if(!r->host.empty() && r->host == host_only) return r.get();
+	}
+	
+	return default_route;
 }
 
 // Tracks which backend gets the *next* request. Advances every call.
-size_t next_backend_index = 0;
+// size_t next_backend_index = 0;
 
 // Round robin: hand back the backend at the current index, then move the
 // index forward, wrapping back to 0 once we reach the end of the list.
-static Backend* get_next_backend() {
-	size_t start = next_backend_index;
+static Backend* get_next_backend(Route* route)
+{
+	auto& backends = route->backends;
+	size_t start = route->next_index;
 	for(size_t i = 0; i < backends.size(); i++)
 	{
 		size_t idx = (start + i) % backends.size();
 		if(backends[idx]->healthy.load())
 		{
-			next_backend_index = (idx + 1) % backends.size();
-			return backends[idx].get();
+			route->next_index = (idx + 1) % backends.size();
+			return backends[idx];
 		}
 	}
 	return nullptr; // every backend is down
@@ -69,7 +120,8 @@ static Backend* get_next_backend() {
 // instead of one blocking function call. This struct is how we remember
 // "where we were" between one event and the next.
 // ---------------------------------------------------------------------------
-enum class ConnState {
+enum class ConnState
+{
 	READING_REQUEST,     // waiting for the client to send its request
 	CONNECTING_BACKEND,  // non-blocking connect() to backend in progress
 	SENDING_REQUEST,     // writing the request to the backend (may take >1 write)
@@ -82,12 +134,14 @@ struct Connection;
 // Attached to epoll_data.ptr for every fd we register. Tells us which
 // Connection this event belongs to, and whether it's the client or backend
 // side of it — since one Connection owns two fds.
-struct SocketCtx {
+struct SocketCtx
+{
 	Connection* conn;
 	bool is_backend;
 };
 
-struct Connection {
+struct Connection
+{
 	int client_fd  = -1;
 	int backend_fd = -1;
 	ConnState state = ConnState::READING_REQUEST;
@@ -97,43 +151,16 @@ struct Connection {
 	std::string response;             // bytes read from the backend
 	size_t request_offset  = 0;       // how much of `request` we've sent so far
 	size_t response_offset = 0;       // how much of `response` we've sent so far
+	
+	bool headers_parsed = false;
+	size_t header_end = std::string::npos;
+	size_t content_length = 0;
+	std::string host;
+	bool keep_alive = true;
 
 	SocketCtx* client_ctx  = nullptr;
 	SocketCtx* backend_ctx = nullptr;
 };
-
-/* static void proxy_to_backend(int client_fd, const char* request, ssize_t request_len, const Backend& backend)
-{
-	int backend_fd = socket(AF_INET, SOCK_STREAM, 0);
-	if(backend_fd < 0)
-	{
-		perror("socket");
-		return;
-	}
-	
-	sockaddr_in backend_addr{};
-	backend_addr.sin_family = AF_INET;
-	backend_addr.sin_port = htons(backend.port);
-	inet_pton(AF_INET, backend.ip.c_str(), &backend_addr.sin_addr);
-	
-	if(connect(backend_fd, (sockaddr*)&backend_addr, sizeof(backend_addr)) < 0)
-	{
-		perror("connect to backend failed");
-		close(backend_fd);
-		return;
-	}
-	
-	write(backend_fd, request, request_len);
-	
-	char response[8192];
-	ssize_t n;
-	while((n = read(backend_fd, response, sizeof(response))) > 0)
-	{
-		write(client_fd, response, n);
-	}
-	
-	close(backend_fd);
-} */
 
 // Make a file descriptor non-blocking. Required for epoll's edge-triggered
 // mode: if a socket were blocking, a read() with no data ready would freeze
@@ -179,16 +206,128 @@ static void close_connection(int epfd, Connection* conn)
 	delete conn;
 }
 
-static void begin_backend_connect(int epfd, Connection* conn)
+static void reset_for_next_request(int epfd, Connection* conn)
 {
-	Backend* backend = get_next_backend();
+	if(conn->backend_fd >= 0)
+	{
+		epoll_ctl(epfd, EPOLL_CTL_DEL, conn->backend_fd, nullptr);
+		close(conn->backend_fd);
+		conn->backend_fd = -1;
+	}
+	
+	delete conn->backend_ctx;
+	conn->backend_ctx = nullptr;
+	conn->backend = nullptr;
+	
+	conn->request.clear();
+	conn->response.clear();
+	conn->request_offset = 0;
+	conn->response_offset = 0;
+	
+	conn->headers_parsed = false;
+	conn->header_end = std::string::npos;
+	conn->content_length = 0;
+	conn->host.clear();
+	conn->keep_alive = true;
+	
+	conn->state = ConnState::READING_REQUEST;
+	epoll_modify(epfd, conn->client_fd, EPOLLIN, conn->client_ctx);
+}
+
+static std::string to_lower(std::string s)
+{
+	for(auto& c : s) c = (char)std::tolower((unsigned char)c);
+	return s;
+}
+
+static bool find_header_end(const std::string& buf, size_t& end_pos)
+{
+	size_t pos = buf.find("\r\n\r\n");
+	if(pos == std::string::npos) return false;
+	end_pos = pos + 4;
+	return true;
+}
+
+static void parse_headers(Connection* conn)
+{
+	const std::string& buf = conn->request;
+	
+	size_t line_end = buf.find("\r\n");
+	if(line_end == std::string::npos) return;
+	std::string request_line = buf.substr(0, line_end);
+	size_t sp1 = request_line.find(' ');
+	size_t sp2 = (sp1 == std::string::npos) ? std::string::npos : request_line.find(' ', sp1 + 1);
+	std::string version = (sp2 == std::string::npos) ? "" : request_line.substr(sp2 + 1);
+	
+	conn->keep_alive = (version == "HTTP/1.1");
+	
+	size_t pos = line_end + 2;
+	while(pos < conn->header_end)
+	{
+		size_t next = buf.find("\r\n", pos);
+		if(next == std::string::npos || next > conn->header_end) break;
+		
+		std::string line = buf.substr(pos, next - pos);
+		if(line.empty()) break;
+		
+		size_t colon = line.find(':');
+		if(colon != std::string::npos)
+		{
+			std::string key = to_lower(line.substr(0, colon));
+			std::string value = line.substr(colon + 1);
+			size_t vstart = value.find_first_not_of(' ');
+			if(vstart != std::string::npos) value = value.substr(vstart);
+			
+			if(key == "host")
+			{
+				conn->host = value;
+			}
+			else if(key == "content-length")
+			{
+				conn->content_length = std::strtoul(value.c_str(), nullptr, 10);
+			}
+			else if(key == "connection")
+			{
+				std::string value_lower = to_lower(value);
+				if(value_lower.find("close") != std::string::npos)
+				{
+					conn->keep_alive = false;
+				}
+			}
+		}
+		pos = next + 2;
+	}
+}
+
+static std::string build_error_response(int code, const char* status_text, const char* body)
+{
+	char resp[512];
+	snprintf(resp, sizeof(resp),
+		"HTTP/1.1 %d %s\r\n"
+		"Content-Type: text/plain\r\n"
+		"Content-Length: %zu\r\n"
+		"Connection: close\r\n"
+		"\r\n"
+		"%s",
+		code, status_text, strlen(body), body);
+	
+	return std::string(resp);
+}
+
+static void begin_backend_connect(int epfd, Connection* conn, Route* route)
+{
+	Backend* backend = get_next_backend(route);
 	if(!backend)
 	{
-		fprintf(stderr, "No healthy backends available! Dropping client fd %d.\n", conn->client_fd);
-		close_connection(epfd, conn);
+		fprintf(stderr, "No healthy backends for route (host='%s')! Returning 503 to fd %d.\n", conn->host.c_str(), conn->client_fd);
+		conn->response   = build_error_response(503, "Service Unavailable", "No healthy backend available for this route.\n");
+		conn->keep_alive = false;
+		conn->state = ConnState::SENDING_RESPONSE;
+		epoll_modify(epfd, conn->client_fd, EPOLLOUT, conn->client_ctx);
 		return;
 	}
-	printf("Connection to backend %s:%d for fd %d...\n", backend->ip.c_str(), backend->port, conn->client_fd);
+	
+	printf("Connecting to backend %s:%d for fd %d (host='%s')...\n", backend->ip.c_str(), backend->port, conn->client_fd, conn->host.empty() ? "(none)" : conn->host.c_str());
 	conn->backend = backend;
 	
 	int backend_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -249,11 +388,28 @@ static void handle_client_event(int epfd, Connection* conn)
 		}
 		
 		conn->request.append(buf, n);
-		printf("Read %zd bytes from client fd %d, connection to backend...\n", n, conn->client_fd);
+		if(!conn->headers_parsed)
+		{
+			size_t end_pos;
+			if(!find_header_end(conn->request, end_pos))
+			{
+				return;
+			}
+			conn->header_end = end_pos;
+			parse_headers(conn);
+			conn->headers_parsed = true;
+		}
 		
+		size_t total_needed = conn->header_end + conn->content_length;
+		if(conn->request.size() < total_needed)
+		{
+			return;
+		}
+		
+		printf("Full request from client fd %d (host= '%s', %zu header bytes, %zu body bytes)\n", conn->client_fd, conn->host.empty() ? "(none)" : conn->host.c_str(), conn->header_end, conn->content_length);		
 		epoll_modify(epfd, conn->client_fd, 0, conn->client_ctx);
-		
-		begin_backend_connect(epfd, conn);
+		Route* route = find_route(conn->host);
+		begin_backend_connect(epfd, conn, route);
 	}
 	else if(conn->state == ConnState::SENDING_RESPONSE)
 	{
@@ -271,8 +427,16 @@ static void handle_client_event(int epfd, Connection* conn)
 		conn->response_offset += n;
 		if(conn->response_offset >= conn->response.size())
 		{
-			printf("Finish sending response to client fd %d, closing.\n", conn->client_fd);
-			close_connection(epfd, conn);
+			if(conn->keep_alive)
+			{
+				printf("Finished response for fd %d, keeping connection alive.\n", conn->client_fd);
+				reset_for_next_request(epfd, conn);
+			}
+			else
+			{
+				 printf("Finished response for fd %d, closing.\n", conn->client_fd);
+				 close_connection(epfd, conn);
+			}
 		}
 	}
 }
@@ -330,7 +494,7 @@ static void handle_backend_event(int epfd, Connection* conn)
 		
 		if(n < 0)
 		{
-			if(n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return;
+			if(errno == EAGAIN || errno == EWOULDBLOCK) return;
 			close_connection(epfd, conn);
 			return;
 		}
@@ -341,6 +505,13 @@ static void handle_backend_event(int epfd, Connection* conn)
 		}
 		
 		printf("Backend response complete (%zu bytes) for client fd %d, sending to client...\n", conn->response.size(), conn->client_fd);
+		
+		epoll_ctl(epfd, EPOLL_CTL_DEL, conn->backend_fd, nullptr);
+		close(conn->backend_fd);
+		conn->backend_fd = -1;
+		delete conn->backend_ctx;
+		conn->backend_ctx = nullptr;
+		
 		conn->state = ConnState::SENDING_RESPONSE;
 		epoll_modify(epfd, conn->client_fd, EPOLLOUT, conn->client_ctx);
 	}
@@ -391,7 +562,7 @@ static void health_check_loop()
 {
 	while(true)
 	{
-		for (auto& backend_ptr : backends)
+		for (auto& backend_ptr : all_backends)
 		{
 			Backend& backend = *backend_ptr;
 			bool ok = tcp_probe(backend.ip, backend.port, HEALTH_CHECK_TIMEOUT_MS);
@@ -442,7 +613,8 @@ static int create_listen_socket(int port)
 
 int main()
 {
-	init_backends();
+	init_backends_and_routes();
+	
 	std::thread health_thread(health_check_loop);
 	health_thread.detach();
 	
@@ -493,11 +665,6 @@ int main()
 				
 				set_nonblocking(client_fd);
 				
-				/* epoll_event client_ev{};
-				client_ev.events = EPOLLIN;
-				client_ev.data.fd = client_fd;
-				epoll_ctl(epfd, EPOLL_CTL_ADD, client_fd, &client_ev);
-				*/
 				Connection* conn = new Connection();
 				conn->client_fd = client_fd;
 				conn->client_ctx = new SocketCtx{conn, false};
@@ -506,31 +673,6 @@ int main()
 			}
 			else
 			{
-				/*
-				int client_fd = events[i].data.fd;
-				char buf[8192];
-				ssize_t n = read(client_fd, buf, sizeof(buf));
-				
-				if(n <= 0)
-				{
-					// n == 0: client closed the connection.
-					// n < 0: read error.
-					// Either way, clean up: epoll auto-removes closed fds,
-					// but we still must close() ourselves to release it.
-					epoll_ctl(epfd, EPOLL_CTL_DEL, client_fd, nullptr);
-					close(client_fd);
-					continue;
-				}
-				
-				Backend& backend = get_next_backend();
-				printf("Read %zd bytes from fd %d, forwarding to %s:%d...\n", n, client_fd, backend.ip.c_str(), backend.port);
-				proxy_to_backend(client_fd, buf, n, backend);
-				// Naive M1 behavior: one request per connection, then close.
-				// Real HTTP keep-alive support comes later once we're
-				// parsing headers properly (M4).
-				epoll_ctl(epfd, EPOLL_CTL_DEL, client_fd, nullptr);
-				close(client_fd);
-				*/
 				
 				SocketCtx* ctx = static_cast<SocketCtx*>(events[i].data.ptr);
 				Connection* conn = ctx->conn;
